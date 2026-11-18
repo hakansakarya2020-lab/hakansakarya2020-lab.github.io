@@ -1,5 +1,5 @@
 // Shared by the lock page and the service worker: the unlocked AES key lives in IndexedDB on this device only.
-const VK_DB = 'vaka-kilit', VK_STORE = 'k';
+var VK_DB = 'vaka-kilit', VK_STORE = 'k';
 function vkOpen() {
   return new Promise((res, rej) => {
     const r = indexedDB.open(VK_DB, 1);

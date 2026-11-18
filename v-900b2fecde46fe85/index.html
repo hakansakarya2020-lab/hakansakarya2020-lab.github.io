@@ -43,55 +43,96 @@ button:disabled{opacity:.6}
 </main>
 <script src="keystore.js"></script>
 <script>
-const $ = id => document.getElementById(id);
-const ios = /iP(hone|ad|od)/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
-const standalone = navigator.standalone === true || matchMedia('(display-mode: standalone)').matches;
-if (ios && !standalone) $('tip').style.display = 'block';
+(function () {
+  // Everything happens in this page: decrypt the app, then replace this document with it.
+  // The service worker only keeps copies of the (encrypted) files for offline use.
+  var $ = function (id) { return document.getElementById(id); };
+  var ios = /iP(hone|ad|od)/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  var standalone = navigator.standalone === true || matchMedia('(display-mode: standalone)').matches;
+  if (ios && !standalone) $('tip').style.display = 'block';
+  if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(function () {});
 
-function b64(s) { return Uint8Array.from(atob(s), c => c.charCodeAt(0)); }
+  function b64(s) { return Uint8Array.from(atob(s), function (c) { return c.charCodeAt(0); }); }
+  function status(t) { $('err').style.color = 'var(--muted)'; $('err').textContent = t; }
+  function fail(t) { $('err').style.color = ''; $('err').textContent = t; }
 
-async function controlled() {
-  if (!('serviceWorker' in navigator)) throw new Error('Bu tarayıcı desteklenmiyor. iPhone\'da Safari kullanın.');
-  await navigator.serviceWorker.register('sw.js');
-  await navigator.serviceWorker.ready;
-  if (navigator.serviceWorker.controller) return;
-  await new Promise(res => {
-    navigator.serviceWorker.addEventListener('controllerchange', res, { once: true });
-    setTimeout(res, 4000);
-  });
-  if (!navigator.serviceWorker.controller) location.reload();
-}
-
-function openApp() { location.replace('app.html'); }
-
-(async () => {
-  try {
-    await controlled();
-    if (await vkGet()) return openApp();
-  } catch (e) { $('err').textContent = e.message; }
-})();
-
-$('f').addEventListener('submit', async ev => {
-  ev.preventDefault();
-  $('err').textContent = '';
-  $('go').disabled = true; $('go').textContent = 'Kontrol ediliyor…';
-  try {
-    if (typeof DecompressionStream === 'undefined') throw new Error('iOS sürümü eski. Ayarlar > Genel > Yazılım Güncelleme ile iOS 16.4 veya üstüne güncelleyin.');
-    const meta = await (await fetch('meta.json', { cache: 'no-cache' })).json();
-    const base = await crypto.subtle.importKey('raw', new TextEncoder().encode($('pw').value.trim()), 'PBKDF2', false, ['deriveBits']);
-    const bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', hash: 'SHA-256', salt: b64(meta.salt), iterations: meta.iter }, base, 256);
-    const key = await crypto.subtle.importKey('raw', bits, 'AES-GCM', false, ['decrypt']);
-    try { await vkDecrypt(key, b64(meta.check)); } catch (_) { throw new Error('Şifre yanlış.'); }
-    try { await vkPut(key); } catch (_) { await vkPut(bits); }
-    await controlled();
-    $('go').textContent = 'Açılıyor…';
-    navigator.serviceWorker.controller.postMessage({ type: 'precache' });
-    openApp();
-  } catch (e) {
-    $('err').textContent = e.message;
-    $('go').disabled = false; $('go').textContent = 'Aç';
+  var meta = null;
+  async function getMeta() {
+    if (meta) return meta;
+    try { meta = await (await fetch('meta.json', { cache: 'no-cache' })).json(); localStorage.setItem('vaka-meta', JSON.stringify(meta)); }
+    catch (e) { meta = JSON.parse(localStorage.getItem('vaka-meta') || 'null'); if (!meta) throw new Error('İnternete bağlanıp tekrar deneyin.'); }
+    return meta;
   }
-});
+  async function bin(path, onProgress) {
+    var c = null;
+    try { c = await caches.open('vaka-data-' + meta.version); var hit = await c.match(path); if (hit) return hit.arrayBuffer(); } catch (_) {}
+    var r = await fetch(path + '?v=' + meta.version);
+    if (!r.ok) throw new Error('Dosya indirilemedi (' + r.status + ').');
+    var total = +r.headers.get('content-length') || 0, buf;
+    if (onProgress && r.body && total) {
+      var rd = r.body.getReader(), parts = [], got = 0;
+      for (;;) { var x = await rd.read(); if (x.done) break; parts.push(x.value); got += x.value.length; onProgress(got / total); }
+      buf = await new Blob(parts).arrayBuffer();
+    } else buf = await r.arrayBuffer();
+    if (c) c.put(path, new Response(buf.slice(0))).catch(function () {});
+    return buf;
+  }
+
+  async function start(key) {
+    status('Uygulama indiriliyor…');
+    var raw = await bin('data/app.bin', function (f) { status('Uygulama indiriliyor… %' + Math.round(f * 100)); });
+    status('Açılıyor…');
+    var html = new TextDecoder().decode(await vkGunzip(await vkDecrypt(key, raw)));
+    var figCache = {};
+    function fix(img) {
+      var m = /^fig\/([A-Za-z0-9_-]+)\.jpg$/.exec(img.getAttribute('src') || '');
+      if (!m) return;
+      var id = m[1];
+      img.removeAttribute('src');
+      (figCache[id] || (figCache[id] = bin('data/fig/' + id + '.bin').then(function (b) { return vkDecrypt(key, b); }).then(function (d) { return URL.createObjectURL(new Blob([d], { type: 'image/jpeg' })); })))
+        .then(function (u) { img.src = u; }).catch(function () { delete figCache[id]; });
+    }
+    document.open(); document.write(html); document.close();
+    var scan = function (n) { if (n.nodeType !== 1) return; if (n.tagName === 'IMG') fix(n); else n.querySelectorAll && n.querySelectorAll('img[src^="fig/"]').forEach(fix); };
+    new MutationObserver(function (ms) { ms.forEach(function (m) { if (m.type === 'attributes') fix(m.target); else m.addedNodes.forEach(scan); }); })
+      .observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ['src'] });
+    scan(document.documentElement);
+    if (navigator.serviceWorker) navigator.serviceWorker.ready.then(function (r) { r.active && r.active.postMessage({ type: 'precache' }); }).catch(function () {});
+  }
+
+  async function checkKey(key) {
+    await getMeta();
+    try { await vkDecrypt(key, b64(meta.check)); return true; } catch (_) { return false; }
+  }
+
+  (async function () {
+    try {
+      var key = await vkGet().catch(function () { return null; });
+      if (key && await checkKey(key)) await start(key);
+    } catch (e) { fail(e.message); }
+  })();
+
+  $('f').addEventListener('submit', async function (ev) {
+    ev.preventDefault();
+    fail('');
+    $('go').disabled = true; $('go').textContent = 'Kontrol ediliyor…';
+    try {
+      if (typeof DecompressionStream === 'undefined') throw new Error('iOS sürümü eski. Ayarlar > Genel > Yazılım Güncelleme ile iOS 16.4 veya üstüne güncelleyin.');
+      await getMeta();
+      var base = await crypto.subtle.importKey('raw', new TextEncoder().encode($('pw').value.trim()), 'PBKDF2', false, ['deriveBits']);
+      var bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', hash: 'SHA-256', salt: b64(meta.salt), iterations: meta.iter }, base, 256);
+      var key = await crypto.subtle.importKey('raw', bits, 'AES-GCM', false, ['decrypt']);
+      if (!(await checkKey(key))) throw new Error('Şifre yanlış.');
+      // Raw bytes are the fallback when a CryptoKey cannot be stored.
+      try { await vkPut(key); } catch (_) { try { await vkPut(bits); } catch (__) {} }
+      $('go').textContent = 'Açılıyor…';
+      await start(key);
+    } catch (e) {
+      fail(e.message || String(e));
+      $('go').disabled = false; $('go').textContent = 'Aç';
+    }
+  });
+})();
 </script>
 </body>
 </html>
